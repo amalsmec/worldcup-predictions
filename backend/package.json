@@ -1,0 +1,20 @@
+{
+  "name": "worldcup-prediction-backend",
+  "version": "1.0.0",
+  "description": "Backend server for World Cup Prediction Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^10.7.9",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "serverless-http": "^4.0.0",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Production build outputs
+dist/
+**/dist/
+
+# Local databases & state
+*.sqlite
+backend/database.sqlite
+backend/database.json
+backend/settings.json
+
+# Netlify files
+.netlify/
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
