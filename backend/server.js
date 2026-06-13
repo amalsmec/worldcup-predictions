@@ -38,6 +38,14 @@ const ADMIN_TOKEN = 'admin-secret-session-token-worldcup-2026';
 app.use(cors());
 app.use(express.json());
 
+// Health check routes
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'World Cup Prediction API is running 🚀' });
+});
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
+
 // Log incoming requests
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
