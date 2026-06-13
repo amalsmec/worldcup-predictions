@@ -3,9 +3,8 @@ const path = require('path');
 
 let dbType = 'sqlite';
 let sqliteDb = null;
-const dbDir = fs.existsSync('/data') ? '/data' : __dirname;
-const jsonFilePath = path.join(dbDir, 'database.json');
-const settingsFilePath = path.join(dbDir, 'settings.json');
+const jsonFilePath = path.join(__dirname, 'database.json');
+const settingsFilePath = path.join(__dirname, 'settings.json');
 
 
 let memoryDb = null;
@@ -39,7 +38,7 @@ function initDb() {
     
     try {
       const sqlite3 = require('sqlite3').verbose();
-      const dbPath = path.join(dbDir, 'database.sqlite');
+      const dbPath = path.join(__dirname, 'database.sqlite');
       sqliteDb = new sqlite3.Database(dbPath, (err) => {
         if (err) {
           console.error('Failed to open SQLite database, falling back to JSON:', err.message);
