@@ -1,0 +1,13 @@
+# Render Blueprint Configuration
+# This file lets Render set up your app automatically.
+services:
+  - type: web
+    name: worldcup-predictions
+    runtime: node
+    buildCommand: npm run install-all && npm run build
+    startCommand: npm run backend
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_PASSWORD
+        value: admin123
