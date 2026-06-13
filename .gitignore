@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Database files
+*.sqlite
+*.sqlite3
+backend/database.json
+backend/settings.json
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build output
+frontend/dist/
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+
+# Scratch/debug files
+scratch_debug_belgium.js
