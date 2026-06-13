@@ -44,58 +44,60 @@ app.use((req, res, next) => {
   next();
 });
 
-// Root API path message/redirect
-app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <head>
-        <title>World Cup Prediction API</title>
-        <style>
-          body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            margin: 0;
-            background: #0f172a;
-            color: #f1f5f9;
-            text-align: center;
-          }
-          .card {
-            background: #1e293b;
-            padding: 2.5rem;
-            border-radius: 1rem;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
-            border: 1px solid #334155;
-            max-width: 500px;
-          }
-          h1 { color: #38bdf8; margin-bottom: 0.5rem; font-size: 1.8rem; }
-          p { color: #94a3b8; font-size: 1.1rem; line-height: 1.6; }
-          a {
-            display: inline-block;
-            margin-top: 1.5rem;
-            padding: 0.75rem 1.5rem;
-            background: #0284c7;
-            color: white;
-            text-decoration: none;
-            border-radius: 0.5rem;
-            font-weight: 600;
-            transition: background 0.2s;
-          }
-          a:hover { background: #0369a1; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>World Cup Predictions API ⚽</h1>
-          <p>The backend API is running successfully. To use the prediction application, please open the frontend dashboard.</p>
-          <a href="http://localhost:5173">Go to Frontend App</a>
-        </div>
-      </body>
-    </html>
-  `);
-});
+// Root API path message/redirect (only in development)
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/', (req, res) => {
+    res.send(`
+      <html>
+        <head>
+          <title>World Cup Prediction API</title>
+          <style>
+            body {
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              height: 100vh;
+              margin: 0;
+              background: #0f172a;
+              color: #f1f5f9;
+              text-align: center;
+            }
+            .card {
+              background: #1e293b;
+              padding: 2.5rem;
+              border-radius: 1rem;
+              box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+              border: 1px solid #334155;
+              max-width: 500px;
+            }
+            h1 { color: #38bdf8; margin-bottom: 0.5rem; font-size: 1.8rem; }
+            p { color: #94a3b8; font-size: 1.1rem; line-height: 1.6; }
+            a {
+              display: inline-block;
+              margin-top: 1.5rem;
+              padding: 0.75rem 1.5rem;
+              background: #0284c7;
+              color: white;
+              text-decoration: none;
+              border-radius: 0.5rem;
+              font-weight: 600;
+              transition: background 0.2s;
+            }
+            a:hover { background: #0369a1; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>World Cup Predictions API ⚽</h1>
+            <p>The backend API is running successfully. To use the prediction application, please open the frontend dashboard.</p>
+            <a href="http://localhost:5173">Go to Frontend App</a>
+          </div>
+        </body>
+      </html>
+    `);
+  });
+}
 
 // Admin authentication middleware
 const authenticateAdmin = (req, res, next) => {
@@ -511,6 +513,18 @@ app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
     res.status(500).json({ error: 'Failed to reset database.' });
   }
 });
+
+// Serve static frontend files in production
+const path = require('path');
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, '../frontend/dist')));
+  
+  // Wildcard route to serve React Index for client-side routing
+  app.get('*', (req, res, next) => {
+    if (req.url.startsWith('/api/')) return next();
+    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+  });
+}
 
 // Initialize DB and start server
 initDb()
