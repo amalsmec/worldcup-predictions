@@ -538,15 +538,21 @@ if (process.env.NODE_ENV === 'production' && fs.existsSync(distPath)) {
 // Initialize DB and start server
 initDb()
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log(`========================================`);
-      console.log(`Admin Username: admin`);
-      console.log(`Admin Password: ${ADMIN_PASSWORD}`);
-      console.log(`========================================`);
-    });
+    if (require.main === module) {
+      app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+        console.log(`========================================`);
+        console.log(`Admin Username: admin`);
+        console.log(`Admin Password: ${ADMIN_PASSWORD}`);
+        console.log(`========================================`);
+      });
+    }
   })
   .catch((err) => {
     console.error('Failed to initialize database:', err);
-    process.exit(1);
+    if (require.main === module) {
+      process.exit(1);
+    }
   });
+
+module.exports = app;

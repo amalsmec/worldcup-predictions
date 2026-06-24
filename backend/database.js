@@ -3,14 +3,53 @@ const path = require('path');
 
 let dbType = 'sqlite';
 let sqliteDb = null;
+let firestore = null;
 const jsonFilePath = path.join(__dirname, 'database.json');
 const settingsFilePath = path.join(__dirname, 'settings.json');
 
+// Check if running in a Firebase Environment (Functions or Emulator)
+const isFirebase = !!(process.env.FIREBASE_CONFIG || process.env.FUNCTIONS_EMULATOR || process.env.USE_FIRESTORE);
+
+if (isFirebase) {
+  dbType = 'json'; // Force JSON logic for Firestore
+  try {
+    const admin = require('firebase-admin');
+    if (admin.apps.length === 0) {
+      admin.initializeApp();
+    }
+    firestore = admin.firestore();
+  } catch (err) {
+    console.error('Failed to initialize Firebase Admin SDK in database.js:', err.message);
+  }
+}
 
 let memoryDb = null;
 
 async function loadDb() {
   if (memoryDb) return memoryDb;
+
+  if (isFirebase && firestore) {
+    try {
+      const doc = await firestore.collection('predictions_db').doc('worldcup').get();
+      if (doc.exists) {
+        memoryDb = doc.data();
+      } else {
+        memoryDb = {
+          users: [],
+          predictions: [],
+          daily_predictions: [],
+          matches: [],
+          tournament_results: null,
+          settings: { bracket_locked: '0' }
+        };
+        await firestore.collection('predictions_db').doc('worldcup').set(memoryDb);
+      }
+      return memoryDb;
+    } catch (err) {
+      console.error('Error loading DB from Firestore, falling back to local file:', err.message);
+    }
+  }
+
   if (!fs.existsSync(jsonFilePath)) {
     memoryDb = {
       users: [],
@@ -28,12 +67,23 @@ async function loadDb() {
 }
 
 async function saveDb() {
+  if (isFirebase && firestore) {
+    try {
+      await firestore.collection('predictions_db').doc('worldcup').set(memoryDb);
+      return;
+    } catch (err) {
+      console.error('Error saving DB to Firestore, falling back to local file:', err.message);
+    }
+  }
+
   fs.writeFileSync(jsonFilePath, JSON.stringify(memoryDb, null, 2));
 }
 
-
 // Initialize database
 function initDb() {
+  if (dbType === 'json') {
+    return setupJsonDb();
+  }
   return new Promise(async (resolve, reject) => {
     
     try {
