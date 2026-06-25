@@ -3,14 +3,32 @@ const path = require('path');
 
 let dbType = 'sqlite';
 let sqliteDb = null;
+let pgPool = null;
 let firestore = null;
 const jsonFilePath = path.join(__dirname, 'database.json');
 const settingsFilePath = path.join(__dirname, 'settings.json');
 
-// Check if running in a Firebase Environment (Functions or Emulator)
-const isFirebase = !!(process.env.FIREBASE_CONFIG || process.env.FUNCTIONS_EMULATOR || process.env.USE_FIRESTORE);
+// Check if PostgreSQL is configured (e.g. on Render)
+const isPostgres = !!process.env.DATABASE_URL;
 
-if (isFirebase) {
+// Check if running in a Firebase Environment (Functions or Emulator)
+const isFirebase = !isPostgres && !!(process.env.FIREBASE_CONFIG || process.env.FUNCTIONS_EMULATOR || process.env.USE_FIRESTORE);
+
+if (isPostgres) {
+  dbType = 'postgres';
+  try {
+    const { Pool } = require('pg');
+    pgPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: {
+        rejectUnauthorized: false
+      }
+    });
+    console.log('PostgreSQL Pool initialized.');
+  } catch (err) {
+    console.error('Failed to initialize PostgreSQL pool:', err.message);
+  }
+} else if (isFirebase) {
   dbType = 'json'; // Force JSON logic for Firestore
   try {
     const admin = require('firebase-admin');
@@ -79,13 +97,152 @@ async function saveDb() {
   fs.writeFileSync(jsonFilePath, JSON.stringify(memoryDb, null, 2));
 }
 
+// Helper to convert SQLite syntax (? placeholders) to PostgreSQL ($1, $2, $3...)
+function convertSqlForPg(sql) {
+  let index = 1;
+  return sql.replace(/\?/g, () => `$${index++}`);
+}
+
+function queryAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    if (dbType === 'postgres') {
+      const pgSql = convertSqlForPg(sql);
+      pgPool.query(pgSql, params, (err, res) => {
+        if (err) return reject(err);
+        resolve(res.rows || []);
+      });
+    } else {
+      sqliteDb.all(sql, params, (err, rows) => {
+        if (err) return reject(err);
+        resolve(rows || []);
+      });
+    }
+  });
+}
+
+function queryRow(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    if (dbType === 'postgres') {
+      const pgSql = convertSqlForPg(sql);
+      pgPool.query(pgSql, params, (err, res) => {
+        if (err) return reject(err);
+        resolve(res.rows[0] || null);
+      });
+    } else {
+      sqliteDb.get(sql, params, (err, row) => {
+        if (err) return reject(err);
+        resolve(row || null);
+      });
+    }
+  });
+}
+
+function runCommand(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    if (dbType === 'postgres') {
+      const pgSql = convertSqlForPg(sql);
+      pgPool.query(pgSql, params, (err, res) => {
+        if (err) return reject(err);
+        resolve({ changes: res.rowCount });
+      });
+    } else {
+      sqliteDb.run(sql, params, function(err) {
+        if (err) return reject(err);
+        resolve({ changes: this.changes });
+      });
+    }
+  });
+}
+
 // Initialize database
 function initDb() {
   if (dbType === 'json') {
     return setupJsonDb();
   }
+  
+  if (dbType === 'postgres') {
+    return new Promise(async (resolve, reject) => {
+      try {
+        // Initialize tables sequentially/together in PostgreSQL
+        await pgPool.query(`
+          CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            phone VARCHAR(255) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            user_type VARCHAR(50) DEFAULT 'public',
+            employee_code VARCHAR(255) DEFAULT NULL,
+            student_id VARCHAR(255) DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        await pgPool.query(`
+          CREATE TABLE IF NOT EXISTS predictions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            prediction_json TEXT,
+            winner VARCHAR(255),
+            champion_only VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        await pgPool.query(`
+          CREATE TABLE IF NOT EXISTS matches (
+            id SERIAL PRIMARY KEY,
+            team_a VARCHAR(255) NOT NULL,
+            team_b VARCHAR(255) NOT NULL,
+            match_date VARCHAR(255) NOT NULL,
+            match_time VARCHAR(255) NOT NULL,
+            actual_score_a INTEGER DEFAULT NULL,
+            actual_score_b INTEGER DEFAULT NULL,
+            is_locked INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        await pgPool.query(`
+          CREATE TABLE IF NOT EXISTS daily_predictions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+            score_a INTEGER NOT NULL,
+            score_b INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, match_id)
+          );
+        `);
+
+        await pgPool.query(`
+          CREATE TABLE IF NOT EXISTS tournament_results (
+            id SERIAL PRIMARY KEY,
+            results_json TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        await pgPool.query(`
+          CREATE TABLE IF NOT EXISTS settings (
+            key VARCHAR(255) PRIMARY KEY,
+            value TEXT
+          );
+        `);
+
+        await pgPool.query(`
+          INSERT INTO settings (key, value) VALUES ('bracket_locked', '0') ON CONFLICT (key) DO NOTHING;
+        `);
+
+        console.log('All PostgreSQL tables initialized successfully.');
+        resolve();
+      } catch (err) {
+        console.error('Failed to initialize PostgreSQL database:', err.message);
+        reject(err);
+      }
+    });
+  }
+
   return new Promise(async (resolve, reject) => {
-    
     try {
       const sqlite3 = require('sqlite3').verbose();
       const dbPath = path.join(__dirname, 'database.sqlite');
@@ -324,7 +481,23 @@ function registerUser(name, phone, password, userType = 'public', employeeCode =
       return reject(new Error('Name, Phone, and Password are required.'));
     }
 
-    if (dbType === 'sqlite') {
+    if (dbType === 'postgres') {
+      pgPool.query(
+        `INSERT INTO users (name, phone, password, user_type, employee_code, student_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [name, phone, password, userType, employeeCode, studentId],
+        (err, res) => {
+          if (err) {
+            if (err.message.includes('unique constraint') || err.message.includes('UNIQUE') || err.message.includes('duplicate key')) {
+              reject(new Error('This phone number is already registered. Please login instead.'));
+            } else {
+              reject(err);
+            }
+          } else {
+            resolve({ id: res.rows[0].id, name, phone, user_type: userType, employee_code: employeeCode, student_id: studentId });
+          }
+        }
+      );
+    } else if (dbType === 'sqlite') {
       sqliteDb.run(
         `INSERT INTO users (name, phone, password, user_type, employee_code, student_id) VALUES (?, ?, ?, ?, ?, ?)`, 
         [name, phone, password, userType, employeeCode, studentId], 
@@ -377,15 +550,7 @@ function loginUser(phone, password) {
       return reject(new Error('Phone number and password are required.'));
     }
 
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT id, name, phone, password, user_type, employee_code, student_id FROM users WHERE phone = ?`, [phone], (err, row) => {
-        if (err) return reject(err);
-        if (!row || row.password !== password) {
-          return reject(new Error('Invalid phone number or password.'));
-        }
-        resolve({ id: row.id, name: row.name, phone: row.phone, user_type: row.user_type, employee_code: row.employee_code, student_id: row.student_id });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const user = db.users.find(u => u.phone === phone && u.password === password);
@@ -397,6 +562,15 @@ function loginUser(phone, password) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryRow(`SELECT id, name, phone, password, user_type, employee_code, student_id FROM users WHERE phone = ?`, [phone])
+        .then(row => {
+          if (!row || row.password !== password) {
+            return reject(new Error('Invalid phone number or password.'));
+          }
+          resolve({ id: row.id, name: row.name, phone: row.phone, user_type: row.user_type, employee_code: row.employee_code, student_id: row.student_id });
+        })
+        .catch(reject);
     }
   });
 }
@@ -404,12 +578,7 @@ function loginUser(phone, password) {
 // Fetch all predictions for a logged-in user
 function getUserPredictions(userId) {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT prediction_json, winner, champion_only FROM predictions WHERE user_id = ?`, [userId], (err, row) => {
-        if (err) return reject(err);
-        resolve(row || { prediction_json: null, winner: null, champion_only: null });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const pred = db.predictions.find(p => p.user_id === parseInt(userId, 10));
@@ -417,6 +586,10 @@ function getUserPredictions(userId) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryRow(`SELECT prediction_json, winner, champion_only FROM predictions WHERE user_id = ?`, [userId])
+        .then(row => resolve(row || { prediction_json: null, winner: null, champion_only: null }))
+        .catch(reject);
     }
   });
 }
@@ -424,22 +597,7 @@ function getUserPredictions(userId) {
 // Fetch user daily score predictions
 function getUserDailyPredictions(userId) {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.all(`
-        SELECT 
-          dp.id, dp.match_id,
-          m.team_a AS match_team_a, m.team_b AS match_team_b, 
-          dp.score_a, dp.score_b, dp.created_at,
-          m.actual_score_a, m.actual_score_b
-        FROM daily_predictions dp
-        JOIN matches m ON dp.match_id = m.id
-        WHERE dp.user_id = ? 
-        ORDER BY dp.created_at DESC
-      `, [userId], (err, rows) => {
-        if (err) return reject(err);
-        resolve(rows || []);
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const preds = (db.daily_predictions || []).filter(dp => dp.user_id === parseInt(userId, 10));
@@ -464,6 +622,20 @@ function getUserDailyPredictions(userId) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryAll(`
+        SELECT 
+          dp.id, dp.match_id,
+          m.team_a AS match_team_a, m.team_b AS match_team_b, 
+          dp.score_a, dp.score_b, dp.created_at,
+          m.actual_score_a, m.actual_score_b
+        FROM daily_predictions dp
+        JOIN matches m ON dp.match_id = m.id
+        WHERE dp.user_id = ? 
+        ORDER BY dp.created_at DESC
+      `, [userId])
+        .then(resolve)
+        .catch(reject);
     }
   });
 }
@@ -481,16 +653,7 @@ function saveBracketPrediction(userId, predictionJson, winner) {
           return reject(new Error('Bracket predictions are locked. You cannot submit or modify predictions.'));
         }
 
-        if (dbType === 'sqlite') {
-          sqliteDb.run(`
-            INSERT INTO predictions (user_id, prediction_json, winner) 
-            VALUES (?, ?, ?) 
-            ON CONFLICT(user_id) DO UPDATE SET prediction_json = ?, winner = ?
-          `, [userId, predictionJson, winner, predictionJson, winner], function(err) {
-            if (err) return reject(err);
-            resolve({ success: true });
-          });
-        } else {
+        if (dbType === 'json') {
           try {
             const db = await loadDb();
             
@@ -514,6 +677,14 @@ function saveBracketPrediction(userId, predictionJson, winner) {
           } catch (err) {
             reject(err);
           }
+        } else {
+          runCommand(`
+            INSERT INTO predictions (user_id, prediction_json, winner) 
+            VALUES (?, ?, ?) 
+            ON CONFLICT(user_id) DO UPDATE SET prediction_json = EXCLUDED.prediction_json, winner = EXCLUDED.winner
+          `, [userId, predictionJson, winner])
+            .then(() => resolve({ success: true }))
+            .catch(reject);
         }
       })
       .catch(reject);
@@ -527,21 +698,7 @@ function saveDirectChampion(userId, champion) {
       return reject(new Error('Champion selection is required.'));
     }
 
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT 1 FROM predictions WHERE user_id = ? AND champion_only IS NOT NULL`, [userId], (checkErr, row) => {
-        if (checkErr) return reject(checkErr);
-        if (row) return reject(new Error('You have already predicted a World Cup champion. Only one entry is allowed.'));
-
-        sqliteDb.run(`
-          INSERT INTO predictions (user_id, champion_only) 
-          VALUES (?, ?) 
-          ON CONFLICT(user_id) DO UPDATE SET champion_only = ?
-        `, [userId, champion, champion], function(err) {
-          if (err) return reject(err);
-          resolve({ success: true });
-        });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         
@@ -568,6 +725,20 @@ function saveDirectChampion(userId, champion) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryRow(`SELECT 1 FROM predictions WHERE user_id = ? AND champion_only IS NOT NULL`, [userId])
+        .then(row => {
+          if (row) return reject(new Error('You have already predicted a World Cup champion. Only one entry is allowed.'));
+
+          runCommand(`
+            INSERT INTO predictions (user_id, champion_only) 
+            VALUES (?, ?) 
+            ON CONFLICT(user_id) DO UPDATE SET champion_only = EXCLUDED.champion_only
+          `, [userId, champion])
+            .then(() => resolve({ success: true }))
+            .catch(reject);
+        })
+        .catch(reject);
     }
   });
 }
@@ -608,7 +779,16 @@ function addMatch(teamA, teamB, date, time) {
       return reject(new Error('Team A and Team B must be different.'));
     }
 
-    if (dbType === 'sqlite') {
+    if (dbType === 'postgres') {
+      pgPool.query(
+        `INSERT INTO matches (team_a, team_b, match_date, match_time) VALUES ($1, $2, $3, $4) RETURNING id`,
+        [teamA, teamB, date, time],
+        (err, res) => {
+          if (err) return reject(err);
+          resolve({ id: res.rows[0].id, team_a: teamA, team_b: teamB, match_date: date, match_time: time });
+        }
+      );
+    } else if (dbType === 'sqlite') {
       sqliteDb.run(`INSERT INTO matches (team_a, team_b, match_date, match_time) VALUES (?, ?, ?, ?)`, [teamA, teamB, date, time], function(err) {
         if (err) return reject(err);
         resolve({ id: this.lastID, team_a: teamA, team_b: teamB, match_date: date, match_time: time });
@@ -641,15 +821,7 @@ function deleteMatch(matchId) {
     const id = parseInt(matchId, 10);
     if (isNaN(id)) return reject(new Error('Invalid match ID.'));
 
-    if (dbType === 'sqlite') {
-      sqliteDb.run(`DELETE FROM matches WHERE id = ?`, [id], function(err) {
-        if (err) return reject(err);
-        sqliteDb.run(`DELETE FROM daily_predictions WHERE match_id = ?`, [id], (delErr) => {
-          if (delErr) console.error('Error cleaning up daily predictions:', delErr);
-          resolve({ changes: this.changes });
-        });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         db.matches = (db.matches || []).filter(m => m.id !== id);
@@ -659,6 +831,11 @@ function deleteMatch(matchId) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      runCommand(`DELETE FROM daily_predictions WHERE match_id = ?`, [id])
+        .then(() => runCommand(`DELETE FROM matches WHERE id = ?`, [id]))
+        .then((res) => resolve({ changes: res.changes }))
+        .catch(reject);
     }
   });
 }
@@ -666,31 +843,7 @@ function deleteMatch(matchId) {
 // Get Scheduled Matches with predictions status
 function getMatches(userId = null) {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      if (userId) {
-        sqliteDb.all(`
-          SELECT 
-            m.id, m.team_a, m.team_b, m.match_date, m.match_time, 
-            m.actual_score_a, m.actual_score_b, m.is_locked,
-            dp.score_a, dp.score_b
-          FROM matches m
-          LEFT JOIN daily_predictions dp ON m.id = dp.match_id AND dp.user_id = ?
-          ORDER BY m.match_date DESC, m.match_time DESC
-        `, [userId], (err, rows) => {
-          if (err) return reject(err);
-          resolve(rows || []);
-        });
-      } else {
-        sqliteDb.all(`
-          SELECT id, team_a, team_b, match_date, match_time, actual_score_a, actual_score_b, is_locked
-          FROM matches 
-          ORDER BY match_date DESC, match_time DESC
-        `, [], (err, rows) => {
-          if (err) return reject(err);
-          resolve(rows || []);
-        });
-      }
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const matches = db.matches || [];
@@ -716,6 +869,28 @@ function getMatches(userId = null) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      if (userId) {
+        queryAll(`
+          SELECT 
+            m.id, m.team_a, m.team_b, m.match_date, m.match_time, 
+            m.actual_score_a, m.actual_score_b, m.is_locked,
+            dp.score_a, dp.score_b
+          FROM matches m
+          LEFT JOIN daily_predictions dp ON m.id = dp.match_id AND dp.user_id = ?
+          ORDER BY m.match_date DESC, m.match_time DESC
+        `, [userId])
+          .then(resolve)
+          .catch(reject);
+      } else {
+        queryAll(`
+          SELECT id, team_a, team_b, match_date, match_time, actual_score_a, actual_score_b, is_locked
+          FROM matches 
+          ORDER BY match_date DESC, match_time DESC
+        `)
+          .then(resolve)
+          .catch(reject);
+      }
     }
   });
 }
@@ -731,48 +906,7 @@ function saveMatchPrediction(userId, matchId, scoreA, scoreB) {
     const sB = parseInt(scoreB, 10);
     const mId = parseInt(matchId, 10);
 
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT actual_score_a, actual_score_b, is_locked, match_date, match_time FROM matches WHERE id = ?`, [mId], (err, match) => {
-        if (err) return reject(err);
-        if (!match) return reject(new Error('Match not found.'));
-        
-        // 1. Result Entered Lock
-        if (match.actual_score_a !== null && match.actual_score_b !== null) {
-          return reject(new Error('Predictions are closed because the final match result has already been entered.'));
-        }
-        
-        // 2. Admin Manual Lock
-        if (match.is_locked === 1) {
-          return reject(new Error('Predictions are locked for this match.'));
-        }
-
-        // 3. Time Lock (5 minutes before match start in IST timezone)
-        if (match.match_date && match.match_time) {
-          const matchStartTime = new Date(`${match.match_date}T${match.match_time}:00+05:30`).getTime();
-          if (!isNaN(matchStartTime)) {
-            const cutoffTime = matchStartTime - (5 * 60 * 1000);
-            if (Date.now() >= cutoffTime) {
-              return reject(new Error('Predictions are closed. You cannot submit predictions within 5 minutes of the match start time.'));
-            }
-          }
-        }
-
-        sqliteDb.run(`
-          INSERT INTO daily_predictions (user_id, match_id, score_a, score_b) 
-          VALUES (?, ?, ?, ?)
-        `, [userId, mId, sA, sB], function(err) {
-          if (err) {
-            if (err.message.includes('UNIQUE constraint failed')) {
-              reject(new Error("You have already submitted a score prediction for this match."));
-            } else {
-              reject(err);
-            }
-          } else {
-            resolve({ success: true });
-          }
-        });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         
@@ -820,6 +954,46 @@ function saveMatchPrediction(userId, matchId, scoreA, scoreB) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryRow(`SELECT actual_score_a, actual_score_b, is_locked, match_date, match_time FROM matches WHERE id = ?`, [mId])
+        .then(match => {
+          if (!match) return reject(new Error('Match not found.'));
+          
+          // 1. Result Entered Lock
+          if (match.actual_score_a !== null && match.actual_score_a !== undefined && match.actual_score_b !== null && match.actual_score_b !== undefined) {
+            return reject(new Error('Predictions are closed because the final match result has already been entered.'));
+          }
+          
+          // 2. Admin Manual Lock
+          if (match.is_locked === 1) {
+            return reject(new Error('Predictions are locked for this match.'));
+          }
+
+          // 3. Time Lock (5 minutes before match start in IST timezone)
+          if (match.match_date && match.match_time) {
+            const matchStartTime = new Date(`${match.match_date}T${match.match_time}:00+05:30`).getTime();
+            if (!isNaN(matchStartTime)) {
+              const cutoffTime = matchStartTime - (5 * 60 * 1000);
+              if (Date.now() >= cutoffTime) {
+                return reject(new Error('Predictions are closed. You cannot submit predictions within 5 minutes of the match start time.'));
+              }
+            }
+          }
+
+          runCommand(`
+            INSERT INTO daily_predictions (user_id, match_id, score_a, score_b) 
+            VALUES (?, ?, ?, ?)
+          `, [userId, mId, sA, sB])
+            .then(() => resolve({ success: true }))
+            .catch(err => {
+              if (err.message.includes('UNIQUE') || err.message.includes('unique constraint')) {
+                reject(new Error("You have already submitted a score prediction for this match."));
+              } else {
+                reject(err);
+              }
+            });
+        })
+        .catch(reject);
     }
   });
 }
@@ -827,90 +1001,7 @@ function saveMatchPrediction(userId, matchId, scoreA, scoreB) {
 // Get statistics for the dashboard
 function getStats() {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.all(`
-        SELECT 
-          u.id, u.name, u.phone, u.user_type, u.employee_code, u.student_id, p.winner, p.prediction_json, p.champion_only, u.created_at 
-        FROM users u 
-        LEFT JOIN predictions p ON u.id = p.user_id 
-        ORDER BY u.created_at DESC
-      `, [], (err, participants) => {
-        if (err) return reject(err);
-
-        sqliteDb.all(`
-          SELECT winner, COUNT(*) as count 
-          FROM predictions 
-          WHERE winner IS NOT NULL 
-          GROUP BY winner 
-          ORDER BY count DESC
-        `, [], (statsErr, winnerStats) => {
-          if (statsErr) return reject(statsErr);
-
-          sqliteDb.all(`
-            SELECT champion_only, COUNT(*) as count 
-            FROM predictions 
-            WHERE champion_only IS NOT NULL 
-            GROUP BY champion_only 
-            ORDER BY count DESC
-          `, [], (championOnlyErr, championOnlyStats) => {
-            if (championOnlyErr) return reject(championOnlyErr);
-
-            sqliteDb.all(`
-              SELECT 
-                dp.user_id, dp.match_id, m.team_a, m.team_b, dp.score_a, dp.score_b
-              FROM daily_predictions dp
-              JOIN matches m ON dp.match_id = m.id
-            `, [], (dailyErr, dailyRows) => {
-              if (dailyErr) return reject(dailyErr);
-
-              sqliteDb.all(`
-                SELECT 
-                  m.id, m.team_a, m.team_b, m.match_date, m.match_time, m.actual_score_a, m.actual_score_b,
-                  COUNT(dp.id) as prediction_count
-                FROM matches m
-                LEFT JOIN daily_predictions dp ON m.id = dp.match_id
-                GROUP BY m.id
-                ORDER BY m.match_date ASC, m.match_time ASC
-              `, [], (matchesErr, matchesList) => {
-                if (matchesErr) return reject(matchesErr);
-
-                const mappedParticipants = participants.map(p => {
-                  const userDaily = dailyRows.filter(dr => dr.user_id === p.id);
-                  return {
-                    ...p,
-                    daily_predictions: userDaily
-                  };
-                });
-
-                getTournamentResults()
-                  .then(tr => {
-                    resolve({
-                      dbType,
-                      totalParticipants: participants.length,
-                      participants: mappedParticipants,
-                      winnerStats,
-                      championOnlyStats,
-                      matches: matchesList,
-                      tournamentResults: tr
-                    });
-                  })
-                  .catch(() => {
-                    resolve({
-                      dbType,
-                      totalParticipants: participants.length,
-                      participants: mappedParticipants,
-                      winnerStats,
-                      championOnlyStats,
-                      matches: matchesList,
-                      tournamentResults: null
-                    });
-                  });
-              });
-            });
-          });
-        });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const matches = db.matches || [];
@@ -994,6 +1085,71 @@ function getStats() {
       } catch (err) {
         reject(err);
       }
+    } else {
+      Promise.all([
+        queryAll(`
+          SELECT 
+            u.id, u.name, u.phone, u.user_type, u.employee_code, u.student_id, p.winner, p.prediction_json, p.champion_only, u.created_at 
+          FROM users u 
+          LEFT JOIN predictions p ON u.id = p.user_id 
+          ORDER BY u.created_at DESC
+        `),
+        queryAll(`
+          SELECT winner, COUNT(*) as count 
+          FROM predictions 
+          WHERE winner IS NOT NULL 
+          GROUP BY winner 
+          ORDER BY count DESC
+        `),
+        queryAll(`
+          SELECT champion_only, COUNT(*) as count 
+          FROM predictions 
+          WHERE champion_only IS NOT NULL 
+          GROUP BY champion_only 
+          ORDER BY count DESC
+        `),
+        queryAll(`
+          SELECT 
+            dp.user_id, dp.match_id, m.team_a, m.team_b, dp.score_a, dp.score_b
+          FROM daily_predictions dp
+          JOIN matches m ON dp.match_id = m.id
+        `),
+        queryAll(`
+          SELECT 
+            m.id, m.team_a, m.team_b, m.match_date, m.match_time, m.actual_score_a, m.actual_score_b,
+            COUNT(dp.id) as prediction_count
+          FROM matches m
+          LEFT JOIN daily_predictions dp ON m.id = dp.match_id
+          GROUP BY m.id, m.team_a, m.team_b, m.match_date, m.match_time, m.actual_score_a, m.actual_score_b
+          ORDER BY m.match_date ASC, m.match_time ASC
+        `),
+        getTournamentResults()
+      ])
+        .then(([participants, winnerStats, championOnlyStats, dailyRows, matchesList, tr]) => {
+          // Map integers for winner counts and prediction count in PostgreSQL
+          const formattedWinnerStats = winnerStats.map(w => ({ winner: w.winner, count: parseInt(w.count, 10) }));
+          const formattedChampionStats = championOnlyStats.map(c => ({ champion_only: c.champion_only, count: parseInt(c.count, 10) }));
+          const formattedMatches = matchesList.map(m => ({ ...m, prediction_count: parseInt(m.prediction_count, 10) }));
+
+          const mappedParticipants = participants.map(p => {
+            const userDaily = dailyRows.filter(dr => dr.user_id === p.id);
+            return {
+              ...p,
+              daily_predictions: userDaily
+            };
+          });
+
+          resolve({
+            dbType,
+            totalParticipants: participants.length,
+            participants: mappedParticipants,
+            winnerStats: formattedWinnerStats,
+            championOnlyStats: formattedChampionStats,
+            matches: formattedMatches,
+            tournamentResults: tr
+          });
+        })
+        .catch(reject);
     }
   });
 }
@@ -1073,12 +1229,7 @@ function clearAllParticipants() {
 
 function getUserById(userId) {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT id, name, phone, user_type, employee_code, student_id FROM users WHERE id = ?`, [userId], (err, row) => {
-        if (err) return reject(err);
-        resolve(row || null);
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const user = db.users.find(u => u.id === parseInt(userId, 10));
@@ -1090,6 +1241,10 @@ function getUserById(userId) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryRow(`SELECT id, name, phone, user_type, employee_code, student_id FROM users WHERE id = ?`, [userId])
+        .then(resolve)
+        .catch(reject);
     }
   });
 }
@@ -1129,16 +1284,7 @@ function updateMatchResult(matchId, actualScoreA, actualScoreB) {
     const scoreA = (actualScoreA === null || actualScoreA === '') ? null : parseInt(actualScoreA, 10);
     const scoreB = (actualScoreB === null || actualScoreB === '') ? null : parseInt(actualScoreB, 10);
 
-    if (dbType === 'sqlite') {
-      sqliteDb.run(`
-        UPDATE matches 
-        SET actual_score_a = ?, actual_score_b = ? 
-        WHERE id = ?
-      `, [scoreA, scoreB, id], function(err) {
-        if (err) return reject(err);
-        resolve({ success: true, changes: this.changes });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const match = (db.matches || []).find(m => m.id === id);
@@ -1153,6 +1299,14 @@ function updateMatchResult(matchId, actualScoreA, actualScoreB) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      runCommand(`
+        UPDATE matches 
+        SET actual_score_a = ?, actual_score_b = ? 
+        WHERE id = ?
+      `, [scoreA, scoreB, id])
+        .then((res) => resolve({ success: true, changes: res.changes }))
+        .catch(reject);
     }
   });
 }
@@ -1162,16 +1316,7 @@ function toggleMatchLock(matchId, isLocked) {
     const id = parseInt(matchId, 10);
     const lockedVal = isLocked ? 1 : 0;
 
-    if (dbType === 'sqlite') {
-      sqliteDb.run(`
-        UPDATE matches 
-        SET is_locked = ? 
-        WHERE id = ?
-      `, [lockedVal, id], function(err) {
-        if (err) return reject(err);
-        resolve({ success: true, changes: this.changes });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         const match = (db.matches || []).find(m => m.id === id);
@@ -1185,32 +1330,41 @@ function toggleMatchLock(matchId, isLocked) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      runCommand(`
+        UPDATE matches 
+        SET is_locked = ? 
+        WHERE id = ?
+      `, [lockedVal, id])
+        .then((res) => resolve({ success: true, changes: res.changes }))
+        .catch(reject);
     }
   });
 }
 
 function getTournamentResults() {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT results_json FROM tournament_results ORDER BY id DESC LIMIT 1`, [], (err, row) => {
-        if (err) return reject(err);
-        if (row && row.results_json) {
-          try {
-            resolve(JSON.parse(row.results_json));
-          } catch (e) {
-            resolve(null);
-          }
-        } else {
-          resolve(null);
-        }
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         resolve(db.tournament_results || null);
       } catch (err) {
         reject(err);
       }
+    } else {
+      queryRow(`SELECT results_json FROM tournament_results ORDER BY id DESC LIMIT 1`)
+        .then(row => {
+          if (row && row.results_json) {
+            try {
+              resolve(JSON.parse(row.results_json));
+            } catch (e) {
+              resolve(null);
+            }
+          } else {
+            resolve(null);
+          }
+        })
+        .catch(reject);
     }
   });
 }
@@ -1220,12 +1374,7 @@ function saveTournamentResults(champion, finalists, semifinalists, quarterfinali
     const resultsObj = { champion, finalists, semifinalists, quarterfinalists };
     const resultsJson = JSON.stringify(resultsObj);
 
-    if (dbType === 'sqlite') {
-      sqliteDb.run(`INSERT INTO tournament_results (results_json) VALUES (?)`, [resultsJson], function(err) {
-        if (err) return reject(err);
-        resolve({ success: true });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         db.tournament_results = resultsObj;
@@ -1234,18 +1383,17 @@ function saveTournamentResults(champion, finalists, semifinalists, quarterfinali
       } catch (err) {
         reject(err);
       }
+    } else {
+      runCommand(`INSERT INTO tournament_results (results_json) VALUES (?)`, [resultsJson])
+        .then(() => resolve({ success: true }))
+        .catch(reject);
     }
   });
 }
 
 function clearTournamentResults() {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.run(`DELETE FROM tournament_results`, [], function(err) {
-        if (err) return reject(err);
-        resolve({ success: true, changes: this.changes });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         db.tournament_results = null;
@@ -1254,18 +1402,17 @@ function clearTournamentResults() {
       } catch (err) {
         reject(err);
       }
+    } else {
+      runCommand(`DELETE FROM tournament_results`)
+        .then((res) => resolve({ success: true, changes: res.changes }))
+        .catch(reject);
     }
   });
 }
 
 function getSetting(key) {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.get(`SELECT value FROM settings WHERE key = ?`, [key], (err, row) => {
-        if (err) return reject(err);
-        resolve(row ? row.value : null);
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         db.settings = db.settings || {};
@@ -1273,21 +1420,17 @@ function getSetting(key) {
       } catch (e) {
         resolve(null);
       }
+    } else {
+      queryRow(`SELECT value FROM settings WHERE key = ?`, [key])
+        .then(row => resolve(row ? row.value : null))
+        .catch(reject);
     }
   });
 }
 
 function saveSetting(key, value) {
   return new Promise(async (resolve, reject) => {
-    if (dbType === 'sqlite') {
-      sqliteDb.run(`
-        INSERT INTO settings (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = ?
-      `, [key, value, value], function(err) {
-        if (err) return reject(err);
-        resolve({ success: true });
-      });
-    } else {
+    if (dbType === 'json') {
       try {
         const db = await loadDb();
         db.settings = db.settings || {};
@@ -1297,8 +1440,13 @@ function saveSetting(key, value) {
       } catch (err) {
         reject(err);
       }
+    } else {
+      runCommand(`
+        INSERT INTO settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+      `, [key, value])
+        .then(() => resolve({ success: true }))
+        .catch(reject);
     }
   });
 }
-
-
